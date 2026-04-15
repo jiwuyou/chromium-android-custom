@@ -12,6 +12,7 @@ This repository tracks the custom Android browser build workflow used on top of 
 ## Layout
 
 - `build_android_apk.sh`: helper script used to build the Android APK from the local Chromium tree
+- `patches/`: exported patch files for the local Chromium customization branch
 
 ## Notes
 
@@ -31,3 +32,8 @@ Recommended workflow:
 - Package name: `org.chromium.chrome`
 - Version name: `149.0.7788.0`
 
+## Current Customization
+
+- Source branch commit: `474f524588`
+- Change: enable Chromium Android DevTools HTTP server on app startup with local-only port `9222`
+- Patch file: `patches/0001-android-enable-local-devtools-port-on-startup.patch`

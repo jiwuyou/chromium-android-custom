@@ -1,0 +1,37 @@
+From 474f524588ba6dbdd487df404a3418398913c5eb Mon Sep 17 00:00:00 2001
+From: root <root@AXYLINUXESC6562950372.local>
+Date: Wed, 15 Apr 2026 02:51:58 +0000
+Subject: [PATCH] android: enable local devtools port on startup
+
+---
+ chrome/browser/android/chrome_startup_flags.cc | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/android/chrome_startup_flags.cc b/chrome/browser/android/chrome_startup_flags.cc
+index 85b79db6a5..5e5c921bb6 100644
+--- a/chrome/browser/android/chrome_startup_flags.cc
++++ b/chrome/browser/android/chrome_startup_flags.cc
+@@ -15,11 +15,19 @@
+ #include "chrome/common/chrome_switches.h"
+ #include "components/browser_sync/browser_sync_switches.h"
+ #include "components/dom_distiller/core/dom_distiller_switches.h"
++#include "content/public/common/content_switches.h"
+ #include "media/base/media_switches.h"
+ 
+ void SetChromeSpecificCommandLineFlags() {
+-  // Enable DOM Distiller backend.
+   base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++
++  // Keep Android Chromium's DevTools HTTP server available on the device's
++  // localhost without needing external startup arguments.
++  if (!command_line->HasSwitch(::switches::kRemoteDebuggingPort)) {
++    command_line->AppendSwitchASCII(::switches::kRemoteDebuggingPort, "9222");
++  }
++
++  // Enable DOM Distiller backend.
+   if (!command_line->HasSwitch(switches::kEnableDomDistiller))
+     command_line->AppendSwitch(switches::kEnableDomDistiller);
+ }
+-- 
+2.43.0
+
