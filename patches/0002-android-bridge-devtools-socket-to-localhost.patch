@@ -1,0 +1,239 @@
+From 61002c29bbcdd9bd69adeeb19a71ee0676a3913b Mon Sep 17 00:00:00 2001
+From: jiwuyou <jiwuyou@users.noreply.github.com>
+Date: Wed, 15 Apr 2026 04:47:50 +0000
+Subject: [PATCH 2/2] android: bridge devtools socket to localhost
+
+---
+ .../chrome/browser/DevToolsServer.java        | 160 +++++++++++++++++-
+ chrome/browser/android/devtools_server.cc     |   1 -
+ 2 files changed, 158 insertions(+), 3 deletions(-)
+
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/DevToolsServer.java b/chrome/android/java/src/org/chromium/chrome/browser/DevToolsServer.java
+index 41a2e57377..312ff4fa5d 100644
+--- a/chrome/android/java/src/org/chromium/chrome/browser/DevToolsServer.java
++++ b/chrome/android/java/src/org/chromium/chrome/browser/DevToolsServer.java
+@@ -5,6 +5,9 @@
+ package org.chromium.chrome.browser;
+ 
+ 
++import android.net.LocalSocket;
++import android.net.LocalSocketAddress;
++import android.os.Process;
+ import android.content.pm.PackageManager;
+ 
+ import androidx.annotation.IntDef;
+@@ -15,17 +18,33 @@ import org.jni_zero.NativeMethods;
+ 
+ import org.chromium.base.ApiCompatibilityUtils;
+ import org.chromium.base.ContextUtils;
++import org.chromium.base.Log;
+ import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
+ 
++import java.io.Closeable;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
+ import java.lang.annotation.Retention;
+ import java.lang.annotation.RetentionPolicy;
++import java.net.InetAddress;
++import java.net.InetSocketAddress;
++import java.net.ServerSocket;
++import java.net.Socket;
+ 
+ /** Controller for Remote Web Debugging (Developer Tools). */
+ @NullMarked
+ public class DevToolsServer {
++    private static final String TAG = "DevToolsServer";
+     private static final String DEBUG_PERMISSION_SIFFIX = ".permission.DEBUG";
++    private static final String SOCKET_NAME_SUFFIX = "_devtools_remote";
++    private static final int LOCALHOST_DEVTOOLS_PORT = 9222;
++    private static final int IO_BUFFER_SIZE = 16 * 1024;
+ 
+     private long mNativeDevToolsServer;
++    private final String mSocketName;
++    private @Nullable ServerSocket mBridgeServerSocket;
+ 
+     // Defines what processes may access to the socket.
+     @IntDef({Security.DEFAULT, Security.ALLOW_DEBUG_PERMISSION})
+@@ -39,10 +58,12 @@ public class DevToolsServer {
+     }
+ 
+     public DevToolsServer(String socketNamePrefix) {
++        mSocketName = socketNamePrefix + SOCKET_NAME_SUFFIX;
+         mNativeDevToolsServer = DevToolsServerJni.get().initRemoteDebugging(socketNamePrefix);
+     }
+ 
+     public void destroy() {
++        stopLocalhostBridge();
+         DevToolsServerJni.get().destroyRemoteDebugging(mNativeDevToolsServer);
+         mNativeDevToolsServer = 0;
+     }
+@@ -53,8 +74,17 @@ public class DevToolsServer {
+ 
+     public void setRemoteDebuggingEnabled(boolean enabled, @Security int security) {
+         boolean allowDebugPermission = security == Security.ALLOW_DEBUG_PERMISSION;
+-        DevToolsServerJni.get()
+-                .setRemoteDebuggingEnabled(mNativeDevToolsServer, enabled, allowDebugPermission);
++        if (enabled) {
++            DevToolsServerJni.get()
++                    .setRemoteDebuggingEnabled(
++                            mNativeDevToolsServer, true, allowDebugPermission);
++            startLocalhostBridge();
++        } else {
++            stopLocalhostBridge();
++            DevToolsServerJni.get()
++                    .setRemoteDebuggingEnabled(
++                            mNativeDevToolsServer, false, allowDebugPermission);
++        }
+     }
+ 
+     public void setRemoteDebuggingEnabled(boolean enabled) {
+@@ -70,6 +100,132 @@ public class DevToolsServer {
+                 == PackageManager.PERMISSION_GRANTED;
+     }
+ 
++    private synchronized void startLocalhostBridge() {
++        if (mBridgeServerSocket != null) return;
++
++        try {
++            ServerSocket serverSocket = new ServerSocket();
++            serverSocket.setReuseAddress(true);
++            serverSocket.bind(
++                    new InetSocketAddress(
++                            InetAddress.getByName("127.0.0.1"), LOCALHOST_DEVTOOLS_PORT));
++            mBridgeServerSocket = serverSocket;
++
++            Thread acceptThread =
++                    new Thread(
++                            () -> acceptBridgeConnections(serverSocket), "ChromeDevToolsBridge");
++            acceptThread.setDaemon(true);
++            acceptThread.start();
++        } catch (IOException e) {
++            Log.e(TAG, "Failed to start localhost DevTools bridge.", e);
++        }
++    }
++
++    private synchronized void stopLocalhostBridge() {
++        closeQuietly(mBridgeServerSocket);
++        mBridgeServerSocket = null;
++    }
++
++    private void acceptBridgeConnections(ServerSocket serverSocket) {
++        while (!serverSocket.isClosed()) {
++            try {
++                Socket tcpSocket = serverSocket.accept();
++                Thread connectionThread =
++                        new Thread(
++                                () -> bridgeConnection(tcpSocket), "ChromeDevToolsBridgeConn");
++                connectionThread.setDaemon(true);
++                connectionThread.start();
++            } catch (IOException e) {
++                if (!serverSocket.isClosed()) {
++                    Log.e(TAG, "Failed to accept localhost DevTools bridge connection.", e);
++                }
++                return;
++            }
++        }
++    }
++
++    private void bridgeConnection(Socket tcpSocket) {
++        LocalSocket devToolsSocket = null;
++        try {
++            devToolsSocket = connectToDevToolsSocket();
++            if (devToolsSocket == null) {
++                Log.w(TAG, "Failed to connect localhost bridge to DevTools socket.");
++                closeQuietly(tcpSocket);
++                return;
++            }
++
++            InputStream tcpInput = tcpSocket.getInputStream();
++            OutputStream tcpOutput = tcpSocket.getOutputStream();
++            InputStream devToolsInput = devToolsSocket.getInputStream();
++            OutputStream devToolsOutput = devToolsSocket.getOutputStream();
++
++            LocalSocket finalDevToolsSocket = devToolsSocket;
++            Thread requestThread =
++                    new Thread(
++                            () ->
++                                    pumpBytes(
++                                            tcpSocket,
++                                            tcpInput,
++                                            finalDevToolsSocket,
++                                            devToolsOutput),
++                            "ChromeDevToolsBridgeReq");
++            requestThread.setDaemon(true);
++            requestThread.start();
++
++            pumpBytes(devToolsSocket, devToolsInput, tcpSocket, tcpOutput);
++        } catch (IOException e) {
++            Log.e(TAG, "DevTools bridge connection failed.", e);
++        } finally {
++            closeQuietly(devToolsSocket);
++            closeQuietly(tcpSocket);
++        }
++    }
++
++    private @Nullable LocalSocket connectToDevToolsSocket() {
++        String pidSocketName = mSocketName + "_" + Process.myPid();
++        String[] socketNames = {pidSocketName, mSocketName};
++        for (String socketName : socketNames) {
++            LocalSocket socket = new LocalSocket();
++            try {
++                socket.connect(
++                        new LocalSocketAddress(socketName, LocalSocketAddress.Namespace.ABSTRACT));
++                return socket;
++            } catch (IOException e) {
++                closeQuietly(socket);
++            }
++        }
++        return null;
++    }
++
++    private static void pumpBytes(
++            Closeable sourceSocket,
++            InputStream input,
++            Closeable destinationSocket,
++            OutputStream output) {
++        byte[] buffer = new byte[IO_BUFFER_SIZE];
++        try {
++            int bytesRead;
++            while ((bytesRead = input.read(buffer)) != -1) {
++                output.write(buffer, 0, bytesRead);
++                output.flush();
++            }
++        } catch (IOException e) {
++            // Connection teardown is expected when either side closes.
++        } finally {
++            closeQuietly(sourceSocket);
++            closeQuietly(destinationSocket);
++        }
++    }
++
++    private static void closeQuietly(@Nullable Closeable closeable) {
++        if (closeable == null) return;
++        try {
++            closeable.close();
++        } catch (IOException e) {
++            // Ignore cleanup failures.
++        }
++    }
++
+     @NativeMethods
+     interface Natives {
+         long initRemoteDebugging(@JniType("std::string") String socketNamePrefix);
+diff --git a/chrome/browser/android/devtools_server.cc b/chrome/browser/android/devtools_server.cc
+index 0f76edb356..33b85eb851 100644
+--- a/chrome/browser/android/devtools_server.cc
++++ b/chrome/browser/android/devtools_server.cc
+@@ -120,7 +120,6 @@ class UnixDomainServerSocketFactory : public content::DevToolsSocketFactory {
+   int last_tethering_socket_;
+   net::UnixDomainServerSocket::AuthCallback auth_callback_;
+ };
+-
+ }  // namespace
+ 
+ DevToolsServer::DevToolsServer(const std::string& socket_name_prefix)
+-- 
+2.43.0
+

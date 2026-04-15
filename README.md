@@ -34,6 +34,13 @@ Recommended workflow:
 
 ## Current Customization
 
-- Source branch commit: `474f524588`
-- Change: enable Chromium Android DevTools HTTP server on app startup with local-only port `9222`
-- Patch file: `patches/0001-android-enable-local-devtools-port-on-startup.patch`
+- Source branch commit: `61002c29bb`
+- Behavior:
+  Chromium on Android now exposes a localhost DevTools HTTP endpoint at `127.0.0.1:9222`
+  while keeping the platform-native `@chrome_devtools_remote` socket.
+- Verified on device:
+  `http://127.0.0.1:9222/json/version`
+  `http://127.0.0.1:9222/json/list`
+- Patch files:
+  `patches/0001-android-enable-local-devtools-port-on-startup.patch`
+  `patches/0002-android-bridge-devtools-socket-to-localhost.patch`
